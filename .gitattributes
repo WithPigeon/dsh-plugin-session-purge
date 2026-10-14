@@ -1,0 +1,9 @@
+# Normalize to LF in the repository, whatever the working copy uses.
+* text=auto eol=lf
+
+# Keep packaged artifacts byte-exact if they are ever committed.
+*.zip binary
+*.tgz binary
+*.png binary
+*.jpg binary
+*.ico binary

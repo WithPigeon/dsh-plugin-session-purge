@@ -1,0 +1,4 @@
+{
+  "title": "Session Purge",
+  "description": "Permanently delete a session from the UI: a trash button beside the session title and a \"Delete session\" row in the session menu, both behind a risk-consent dialog. Removes the log, the projection cache and the workspace accounting, and adds a session_purge tool."
+}

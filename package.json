@@ -1,0 +1,56 @@
+{
+  "name": "dsh-plugin-session-purge",
+  "version": "0.1.0",
+  "description": "Permanently delete DeepSeek Harness sessions from the UI: a conversation-header trash button and a session-row menu entry, both behind a risk-consent dialog, plus a session_purge tool for agents. Removes the session log, projection cache and workspace accounting so nothing is resurrected.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "session",
+    "delete",
+    "purge"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "author": "WithPigeon",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WithPigeon/dsh-plugin-session-purge.git"
+  },
+  "homepage": "https://github.com/WithPigeon/dsh-plugin-session-purge#readme",
+  "bugs": {
+    "url": "https://github.com/WithPigeon/dsh-plugin-session-purge/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node verify-session-purge.mjs"
+  },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "src/",
+    "locale/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

@@ -1,0 +1,15 @@
+# ============================================================================
+# dsh-plugin-session-purge — bundle patch
+# ============================================================================
+# Inserted into the profile config tree, after the profile's own bundles.
+#
+#   dsh plugin --profile <profile> add file:C:/path/to/dsh-plugin-session-purge
+#
+# The package ships both halves:
+#   host   src/index.js   — delete chain, /__session-purge/* routes, session_purge tool
+#   client src/client.js  — header button, session-row menu entry, consent dialog
+# ============================================================================
+
+- insert:
+    - id: dsh-plugin-session-purge
+      name: dsh-plugin-session-purge
