@@ -417,6 +417,312 @@ async function detachWorkspaceAccounting(ctx, sessionId, accounting) {
   return changed
 }
 
+// --- the recycle bin ---------------------------------------------------------
+//
+// "Deleting" in the UI is a two-step operation. Moving a Session to the recycle
+// bin only ARCHIVES it; the purge chain below runs only when the user asks for a
+// permanent delete from inside the bin.
+//
+// Archiving is the Harness's own hiding mechanism: the sidebar's `sessionVisible`
+// filters archived ids out of the default view, and the archive set is what
+// `agent/pre-step` gates future wakes on. Crucially, archiving never touches a
+// Session's workspace accounting, so `unarchiveSession` returns the Session to
+// its recorded position on its own — the bin does not have to remember which
+// Workspace it came from, and a restore cannot misplace it.
+//
+// The bin index is a small JSON file beside the other Harness state, and it is
+// reconciled on every read: an entry whose Session is gone (purged elsewhere) or
+// no longer archived (restored through the Harness's own archive view) is
+// dropped, so the index can never outlive or contradict the real state.
+
+const TRASH_VERSION = 1
+
+function trashFile() {
+  return path.join(dshHome(), 'session-purge', 'trash.json')
+}
+
+function emptyTrashState() {
+  return { version: TRASH_VERSION, entries: [] }
+}
+
+function readTrashState() {
+  let parsed
+  try {
+    parsed = JSON.parse(fs.readFileSync(trashFile(), 'utf8'))
+  } catch {
+    return emptyTrashState()
+  }
+  if (!parsed || !Array.isArray(parsed.entries)) return emptyTrashState()
+  const entries = []
+  for (const entry of parsed.entries) {
+    if (!entry || typeof entry.sessionId !== 'string') continue
+    if (!SESSION_ID_RE.test(entry.sessionId)) continue
+    entries.push({
+      sessionId: entry.sessionId,
+      title: typeof entry.title === 'string' ? entry.title : null,
+      deletedAt: typeof entry.deletedAt === 'string' ? entry.deletedAt : null,
+    })
+  }
+  return { version: TRASH_VERSION, entries }
+}
+
+// Write through a temporary file and rename, so a crash mid-write cannot leave a
+// truncated index that would silently lose every entry.
+function writeTrashState(state) {
+  const file = trashFile()
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`
+  fs.writeFileSync(temporary, JSON.stringify(state, null, 2), 'utf8')
+  fs.renameSync(temporary, file)
+}
+
+function sameSession(left, right) {
+  const variants = idVariants(left)
+  return idVariants(right).some((variant) => variants.includes(variant))
+}
+
+function findTrashEntry(state, sessionId) {
+  return state.entries.find((entry) => sameSession(entry.sessionId, sessionId))
+}
+
+// Idempotent: reports whether an entry was actually dropped.
+function dropTrashEntry(sessionId) {
+  const state = readTrashState()
+  const kept = state.entries.filter((entry) => !sameSession(entry.sessionId, sessionId))
+  if (kept.length === state.entries.length) return false
+  writeTrashState({ version: TRASH_VERSION, entries: kept })
+  return true
+}
+
+// The archived flag, or undefined when no readable surface exposes the set.
+//
+// A `false` here is only trusted when the set could actually be READ: reporting
+// "not archived" because the surface was unavailable would silently empty the
+// bin behind the user's back during a reconcile.
+function archivedState(ctx, sessionId) {
+  const variants = idVariants(sessionId)
+  const registry = ctx.get('workspaceRegistry')
+  if (registry && Array.isArray(registry.archivedSessionIds)) {
+    return variants.some((variant) => registry.archivedSessionIds.includes(variant))
+  }
+  const storageDomain = ctx.get('storageDomain')
+  if (storageDomain && typeof storageDomain.get === 'function') {
+    try {
+      const domain = storageDomain.get('workspace')
+      const global = domain && domain.global
+      const state = global && typeof global.get === 'function' ? global.get() : null
+      if (state && Array.isArray(state.archivedSessionIds)) {
+        return variants.some((variant) => state.archivedSessionIds.includes(variant))
+      }
+    } catch {
+      /* unreadable: unknown, not "not archived" */
+    }
+  }
+  return undefined
+}
+
+async function sessionExists(ctx, sessionId) {
+  if (findSessionDirs(sessionId).length > 0) return true
+  return projectionRowExists(ctx, sessionId)
+}
+
+// The display title the projection cache holds, used when the caller did not
+// send one (the agent tool has no row props to read it from).
+function projectionTitle(ctx, sessionId) {
+  const storageDomain = ctx.get('storageDomain')
+  if (!storageDomain || typeof storageDomain.get !== 'function') return null
+  try {
+    const domain = storageDomain.get('session_projcache')
+    if (!domain || typeof domain.table !== 'function') return null
+    const table = domain.table('sessions')
+    if (typeof table.get !== 'function') return null
+    for (const variant of idVariants(sessionId)) {
+      const record = table.get(variant)
+      const rows = record && typeof record === 'object' && record.rows ? record.rows : null
+      const title = rows && rows.title ? rows.title.val : null
+      if (typeof title === 'string' && title.trim()) return title
+    }
+  } catch {
+    /* domain closed */
+  }
+  return null
+}
+
+// Toggle the archived flag through the owning service. The registry is preferred
+// because it writes the same durable record the Harness's own archive action
+// writes, so the bin and the built-in archived view can never disagree. The
+// workspace storage domain is the fallback for a profile without the registry.
+async function setArchived(ctx, sessionId, wanted) {
+  const variants = idVariants(sessionId)
+
+  const registry = ctx.get('workspaceRegistry')
+  if (
+    registry &&
+    typeof registry.archiveSession === 'function' &&
+    typeof registry.unarchiveSession === 'function'
+  ) {
+    if (wanted) {
+      // Try every spelling: the registry resolves ids against its own records,
+      // and a Session id appears as both a raw uuid and `session-<uuid>`.
+      let lastError
+      for (const variant of variants) {
+        try {
+          await registry.archiveSession(variant, { stopActivity: true })
+          return 'registry'
+        } catch (error) {
+          lastError = error
+        }
+      }
+      throw lastError instanceof Error ? lastError : new PurgeError(String(lastError), 500)
+    }
+    // Unarchiving runs no existence check and is a no-op when the id is absent,
+    // so EVERY spelling is tried: a no-op does not throw, so returning after the
+    // first one would leave the other spelling archived and the Session hidden.
+    for (const variant of variants) {
+      try {
+        await registry.unarchiveSession(variant)
+      } catch {
+        /* a miss is not a failure: the id may simply be spelled the other way */
+      }
+    }
+    return 'registry'
+  }
+
+  const storageDomain = ctx.get('storageDomain')
+  if (!storageDomain || typeof storageDomain.get !== 'function') {
+    throw new PurgeError('the workspace registry is unavailable, so this session cannot be archived', 503)
+  }
+  let domain
+  try {
+    domain = storageDomain.get('workspace')
+  } catch {
+    domain = null
+  }
+  const global = domain && domain.global
+  if (!global || typeof global.get !== 'function' || typeof global.set !== 'function') {
+    throw new PurgeError('the workspace registry is unavailable, so this session cannot be archived', 503)
+  }
+  const state = global.get()
+  if (!state) throw new PurgeError('the workspace registry holds no state to write', 503)
+
+  const archived = Array.isArray(state.archivedSessionIds) ? state.archivedSessionIds.slice() : []
+  const pinned = Array.isArray(state.pinnedSessionIds) ? state.pinnedSessionIds.slice() : []
+  const next = { ...state }
+  if (wanted) {
+    if (!variants.some((variant) => archived.includes(variant))) archived.unshift(sessionId)
+    next.archivedSessionIds = archived
+    // Pinning and archival are mutually exclusive in the registry too.
+    next.pinnedSessionIds = pinned.filter((id) => !variants.includes(id))
+  } else {
+    next.archivedSessionIds = archived.filter((id) => !variants.includes(id))
+  }
+  await global.set(next)
+  return 'domain'
+}
+
+/**
+ * Move one Session to the recycle bin: archive it and record when.
+ * @throws {PurgeError} on an invalid id, an unknown Session, or an unavailable registry.
+ */
+async function moveToTrash(ctx, rawSessionId, rawTitle) {
+  const sessionId = String(rawSessionId || '').trim()
+  if (!SESSION_ID_RE.test(sessionId)) {
+    throw new PurgeError(`invalid session id: ${sessionId || '(empty)'}`, 400)
+  }
+  if (!(await sessionExists(ctx, sessionId))) {
+    throw new PurgeError(`session not found: ${sessionId}`, 404)
+  }
+
+  const via = await setArchived(ctx, sessionId, true)
+
+  const state = readTrashState()
+  const previous = findTrashEntry(state, sessionId)
+  const requested = typeof rawTitle === 'string' ? rawTitle.trim() : ''
+  const entry = {
+    sessionId,
+    title: requested || (previous && previous.title) || projectionTitle(ctx, sessionId) || null,
+    deletedAt: new Date().toISOString(),
+  }
+  const kept = state.entries.filter((item) => !sameSession(item.sessionId, sessionId))
+  kept.unshift(entry)
+  writeTrashState({ version: TRASH_VERSION, entries: kept })
+  return { entry, via }
+}
+
+/** The bin's contents, newest first, with stale entries reconciled away. */
+async function listTrash(ctx) {
+  const state = readTrashState()
+  const kept = []
+  let changed = false
+  for (const entry of state.entries) {
+    if (!(await sessionExists(ctx, entry.sessionId))) {
+      changed = true
+      continue
+    }
+    if (archivedState(ctx, entry.sessionId) === false) {
+      // Restored through the Harness's own archived view: the bin must not keep
+      // claiming a Session that is already back in the list.
+      changed = true
+      continue
+    }
+    kept.push({
+      sessionId: entry.sessionId,
+      title: entry.title || projectionTitle(ctx, entry.sessionId) || null,
+      deletedAt: entry.deletedAt,
+    })
+  }
+  if (changed) writeTrashState({ version: TRASH_VERSION, entries: kept })
+  kept.sort((left, right) => String(right.deletedAt || '').localeCompare(String(left.deletedAt || '')))
+  return kept
+}
+
+/**
+ * Put one Session back: unarchive it and forget the bin entry.
+ * @throws {PurgeError} when the id is unknown or the Session is not in the bin.
+ */
+async function restoreFromTrash(ctx, rawSessionId) {
+  const sessionId = String(rawSessionId || '').trim()
+  if (!SESSION_ID_RE.test(sessionId)) {
+    throw new PurgeError(`invalid session id: ${sessionId || '(empty)'}`, 400)
+  }
+  const state = readTrashState()
+  const entry = findTrashEntry(state, sessionId)
+  if (!entry) {
+    throw new PurgeError(`session is not in the recycle bin: ${sessionId}`, 404)
+  }
+  if (!(await sessionExists(ctx, sessionId))) {
+    dropTrashEntry(sessionId)
+    throw new PurgeError(`session files are gone, so it cannot be restored: ${sessionId}`, 410)
+  }
+  await setArchived(ctx, sessionId, false)
+  dropTrashEntry(sessionId)
+  return { sessionId, title: entry.title || null }
+}
+
+/** Permanently delete everything in the bin, keeping only what failed. */
+async function emptyRecycleBin(ctx) {
+  const state = readTrashState()
+  const purged = []
+  const failed = []
+  const keep = []
+  for (const entry of state.entries) {
+    try {
+      const report = await purgeSession(ctx, entry.sessionId)
+      purged.push({ sessionId: entry.sessionId, title: entry.title || null, ...report })
+    } catch (error) {
+      if (error instanceof PurgeError && error.status === 404) {
+        // Already gone: the entry was stale, so the bin is still emptied.
+        purged.push({ sessionId: entry.sessionId, title: entry.title || null, alreadyGone: true })
+      } else {
+        failed.push({ sessionId: entry.sessionId, title: entry.title || null, error: error.message })
+        keep.push(entry)
+      }
+    }
+  }
+  writeTrashState({ version: TRASH_VERSION, entries: keep })
+  return { purged, failed }
+}
+
 // --- the operation -----------------------------------------------------------
 
 /**
@@ -493,6 +799,10 @@ async function purgeSession(ctx, rawSessionId) {
     throw new PurgeError(`session not found: ${sessionId}`, 404)
   }
 
+  // A permanent delete always leaves the bin, whether it was asked for from the
+  // bin itself, from the agent tool, or while the entry was already stale.
+  const trashEntryDropped = dropTrashEntry(sessionId)
+
   return {
     sessionId,
     stopped,
@@ -501,6 +811,7 @@ async function purgeSession(ctx, rawSessionId) {
     logDirsRemoved,
     projectionRowRemoved,
     workspaceAccountingDetached,
+    trashEntryDropped,
   }
 }
 
@@ -639,6 +950,33 @@ export function apply(ctx) {
   }
 
   function registerRoutes(webServer, owner) {
+    // Every mutating route has the same shape: fence, method, JSON body,
+    // operation, JSON answer. Keeping it in one place is what makes it possible
+    // to promise that no failure escapes as the carrier's bare 400.
+    function postRoute(routePath, run) {
+      owner.effect(() =>
+        webServer.register({
+          kind: 'exact',
+          path: routePath,
+          handler: guard(async (req, res) => {
+            if (rejectIfUntrusted(ctx, req, res)) return
+            if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
+            let body
+            try {
+              body = await readJsonBody(req)
+            } catch (error) {
+              return sendJson(res, error.status || 400, { error: error.message })
+            }
+            try {
+              sendJson(res, 200, { ok: true, ...(await run(body)) })
+            } catch (error) {
+              sendJson(res, error instanceof PurgeError ? error.status : 500, { error: error.message })
+            }
+          }),
+        }),
+      )
+    }
+
     owner.effect(() =>
       webServer.register({
         kind: 'exact',
@@ -651,12 +989,16 @@ export function apply(ctx) {
       }),
     )
 
+    // GET reads the bin; POST moves one Session into it.
     owner.effect(() =>
       webServer.register({
         kind: 'exact',
-        path: '/__session-purge/purge',
+        path: '/__session-purge/trash',
         handler: guard(async (req, res) => {
           if (rejectIfUntrusted(ctx, req, res)) return
+          if (req.method === 'GET') {
+            return sendJson(res, 200, { ok: true, entries: await listTrash(ctx) })
+          }
           if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
           let body
           try {
@@ -665,14 +1007,18 @@ export function apply(ctx) {
             return sendJson(res, error.status || 400, { error: error.message })
           }
           try {
-            const report = await purgeSession(ctx, body.sessionId)
-            sendJson(res, 200, { ok: true, ...report })
+            const result = await moveToTrash(ctx, body.sessionId, body.title)
+            sendJson(res, 200, { ok: true, ...result })
           } catch (error) {
             sendJson(res, error instanceof PurgeError ? error.status : 500, { error: error.message })
           }
         }),
       }),
     )
+
+    postRoute('/__session-purge/restore', (body) => restoreFromTrash(ctx, body.sessionId))
+    postRoute('/__session-purge/empty', () => emptyRecycleBin(ctx))
+    postRoute('/__session-purge/purge', (body) => purgeSession(ctx, body.sessionId))
   }
 
   const webServer = ctx.get('webServer')
@@ -688,7 +1034,7 @@ export function apply(ctx) {
     ctx.tools.register({
       name: 'session_purge',
       description:
-        'Permanently delete one Session of this Harness profile. Stops the Session\'s agent if it is running, then removes its persisted log, its projection-cache row and its workspace/archive/pin accounting. Permanent and irreversible: the conversation record is gone. Use the session id, not the title.',
+        'Permanently delete one Session of this Harness profile, bypassing the recycle bin. Stops the Session\'s agent if it is running, then removes its persisted log, its projection-cache row and its workspace/archive/pin accounting. Permanent and irreversible: the conversation record is gone. Use the session id, not the title.',
       parameters: {
         type: 'object',
         properties: {

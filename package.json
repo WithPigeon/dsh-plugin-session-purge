@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-session-purge",
-  "version": "0.1.0",
-  "description": "Permanently delete DeepSeek Harness sessions from the UI: a conversation-header trash button and a session-row menu entry, both behind a risk-consent dialog, plus a session_purge tool for agents. Removes the session log, projection cache and workspace accounting so nothing is resurrected.",
+  "version": "0.2.0",
+  "description": "A recycle bin for DeepSeek Harness sessions: deleting a session moves it to a bin at the sidebar foot, where it keeps its title and deletion time and can be restored, deleted permanently, or cleared in bulk. Also adds a session_purge tool for agents.",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -25,7 +25,9 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node verify-session-purge.mjs"
+    "test": "node verify-session-purge.mjs && node verify-client-half.mjs",
+    "test:host": "node verify-session-purge.mjs",
+    "test:client": "node verify-client-half.mjs"
   },
   "main": "src/index.js",
   "exports": {

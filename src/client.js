@@ -1,29 +1,38 @@
 // dsh-plugin-session-purge — CLIENT half.
 //
-// Registers three slot occupants that together delete a Session permanently:
+// Four slot occupants implement a two-step delete:
+//
+//   sidebar.footer.action                id 'session-purge-trash', order 10
+//       The recycle-bin entry at the sidebar foot, beside Settings. It carries
+//       the bin's item count and opens the bin panel. Owner prop `wide` tells it
+//       whether the column is expanded or the 56px rail, so the label appears
+//       only when there is room for it.
 //
 //   sidebar.workspaces.session.menu.item  id 'session-purge', order 500
-//       A "Delete session" row in the Session row's "..." menu, beside the
-//       shipped pin/rename/fork/archive rows. It receives the row's
-//       `sessionId` + `displayTitle` owner props and the menu's
-//       `useMenuOpenState` hook, so it never has to guess which Session the
-//       menu belongs to and never switches the conversation.
+//       A "Move to recycle bin" row in the Session row's "..." menu, beside the
+//       shipped pin/rename/fork/archive rows. It receives the row's `sessionId`
+//       + `displayTitle` owner props and the menu's `useMenuOpenState` hook.
 //
 //   conversation.session.header.actions   id 'session-purge', order 30
-//       A trash button beside the Session title for the open Session.
+//       The same action as a button beside the open Session's title.
 //
-//   shell.overlay                         id 'session-purge-dialog'
-//       The one risk-consent dialog both entry points raise. It is a
-//       frame-wide overlay occupant, and the only thing that talks to the
-//       Host.
+//   shell.overlay (two occupants)
+//       id 'session-purge-dialog', order 100  — the confirm for moving a Session
+//         into the bin. Reversible, so it asks once and needs no acknowledgement.
+//       id 'session-purge-trash-panel', order 110 — the bin itself: titles,
+//         deletion dates, per-row restore and permanent delete, and empty-all.
 //
 // Host protocol (registered by the package's Host half):
-//   POST /__session-purge/purge   { sessionId } -> { ok, ...report }
+//   GET  /__session-purge/trash     -> { ok, entries: [{ sessionId, title, deletedAt }] }
+//   POST /__session-purge/trash     { sessionId, title? } -> { ok, entry }
+//   POST /__session-purge/restore   { sessionId }         -> { ok }
+//   POST /__session-purge/purge     { sessionId }         -> { ok, ...report }
+//   POST /__session-purge/empty                           -> { ok, purged, failed }
 //
 // Deliberate constraints, per the Cordis plugin guide:
 //   * plain React only — no Harness Client package (no ui-primitives) is
 //     imported, so the bundle cannot break on a Client package version bump;
-//     the trash glyph is an inline SVG and the dialog is plain markup.
+//     every glyph is an inline SVG and every surface is plain markup.
 //   * theme tokens only (--dsw-*) for every colour, so light/dark both work.
 //   * all visible text goes through the Client locale service (ns
 //     'session-purge'), with a browser-language fallback dictionary.
@@ -38,58 +47,108 @@ window.__ModuleLoader__.load({
 
     const MENU_SLOT = 'sidebar.workspaces.session.menu.item'
     const HEADER_SLOT = 'conversation.session.header.actions'
+    const FOOTER_SLOT = 'sidebar.footer.action'
     const OVERLAY_SLOT = 'shell.overlay'
 
     const ID_MENU = 'session-purge'
     const ID_HEADER = 'session-purge'
+    const ID_FOOTER = 'session-purge-trash'
     const ID_DIALOG = 'session-purge-dialog'
+    const ID_PANEL = 'session-purge-trash-panel'
 
-    const ENDPOINT = '/__session-purge/purge'
+    const BASE = '/__session-purge'
+
+    // How long a row's "delete permanently" button stays armed.
+    const CONFIRM_WINDOW_MS = 5000
 
     // --- dictionaries ---------------------------------------------------------
 
     const zh = {
-      'menu.delete': '彻底删除会话',
-      'button.title': '彻底删除会话',
-      'button.titleRunning': '彻底删除会话（运行中，删除会先停止任务）',
+      'menu.delete': '移到回收站',
+      'button.title': '移到回收站',
+      'button.titleRunning': '移到回收站（运行中，会先停止任务）',
 
-      'dialog.title': '彻底删除会话',
+      'footer.label': '回收站',
+      'footer.title': '回收站',
+      'footer.countTitle': '回收站：',
+
+      'dialog.title': '移到回收站',
       'dialog.nameLabel': '会话',
       'dialog.idLabel': '会话 ID',
       'dialog.untitled': '未命名会话',
-
-      'dialog.desc': '将永久删除该会话的日志、投影缓存与工作区记账。此操作不可恢复。',
-      'dialog.running': '该会话正在运行。删除会先停止它的任务，进行中的工作将立即中断且无法恢复。',
-      'dialog.notFound': '没有找到这个会话，它可能已经被删除。请刷新会话列表后重试。',
-
-      'dialog.ack': '我已了解后果，确认彻底删除',
+      'dialog.desc': '会话会从列表移到回收站。之后可以随时从回收站恢复，或者在那里彻底删除。',
+      'dialog.running': '该会话正在运行，移到回收站会先停止它的任务，进行中的工作将中断。',
+      'dialog.confirm': '移到回收站',
+      'dialog.busy': '正在移动…',
       'dialog.cancel': '取消',
-      'dialog.confirm': '删除',
-      'dialog.busy': '正在删除…',
-      'dialog.deleted': '已彻底删除',
-      'dialog.failed': '删除失败',
+      'dialog.failed': '移动失败',
+
+      'panel.title': '回收站',
+      'panel.subtitle': '删除的会话先放在这里，可以恢复，也可以彻底删除。',
+      'panel.empty': '回收站是空的',
+      'panel.emptyHint': '在会话列表中删除的会话会先进入这里。',
+      'panel.deletedAt': '删除于',
+      'panel.untitled': '未命名会话',
+      'panel.restore': '恢复',
+      'panel.restoring': '正在恢复…',
+      'panel.cancel': '取消',
+      'panel.purge': '彻底删除',
+      'panel.purgeConfirm': '确认彻底删除？',
+      'panel.purging': '正在彻底删除…',
+      'panel.emptyBin': '清空回收站',
+      'panel.confirmEmpty': '清空会永久删除回收站里的全部会话，不可恢复。',
+      'panel.confirmEmptyYes': '确认清空',
+      'panel.emptying': '正在清空…',
+      'panel.close': '关闭',
+      'panel.busy': '处理中…',
+      'panel.failed': '操作失败',
+      'panel.partialFailed': '有会话没能删除，仍留在回收站里。',
+      'panel.count': '共',
+      'panel.countUnit': '个会话',
     }
 
     const en = {
-      'menu.delete': 'Delete session permanently',
-      'button.title': 'Delete session permanently',
-      'button.titleRunning': 'Delete session permanently (running — its task is stopped first)',
+      'menu.delete': 'Move to recycle bin',
+      'button.title': 'Move to recycle bin',
+      'button.titleRunning': 'Move to recycle bin (running \u2014 its task is stopped first)',
 
-      'dialog.title': 'Delete session permanently',
+      'footer.label': 'Recycle bin',
+      'footer.title': 'Recycle bin',
+      'footer.countTitle': 'Recycle bin:',
+
+      'dialog.title': 'Move to recycle bin',
       'dialog.nameLabel': 'Session',
       'dialog.idLabel': 'Session ID',
       'dialog.untitled': 'Untitled session',
-
-      'dialog.desc': 'Permanently deletes this session\u2019s log, projection cache and workspace accounting. This cannot be undone.',
-      'dialog.running': 'This session is running. Deleting it stops its task first; work in progress is interrupted and cannot be recovered.',
-      'dialog.notFound': 'This session was not found — it may already be deleted. Refresh the session list and try again.',
-
-      'dialog.ack': 'I understand the consequences \u2014 delete permanently',
+      'dialog.desc': 'The session moves out of the list and into the recycle bin. You can restore it from there at any time, or delete it permanently.',
+      'dialog.running': 'This session is running. Moving it to the recycle bin stops its task first; work in progress is interrupted.',
+      'dialog.confirm': 'Move to recycle bin',
+      'dialog.busy': 'Moving\u2026',
       'dialog.cancel': 'Cancel',
-      'dialog.confirm': 'Delete',
-      'dialog.busy': 'Deleting\u2026',
-      'dialog.deleted': 'Permanently deleted',
-      'dialog.failed': 'Delete failed',
+      'dialog.failed': 'Move failed',
+
+      'panel.title': 'Recycle bin',
+      'panel.subtitle': 'Deleted sessions wait here. Restore one, or delete it permanently.',
+      'panel.empty': 'The recycle bin is empty',
+      'panel.emptyHint': 'A session you delete from the list lands here first.',
+      'panel.deletedAt': 'Deleted',
+      'panel.untitled': 'Untitled session',
+      'panel.restore': 'Restore',
+      'panel.restoring': 'Restoring\u2026',
+      'panel.cancel': 'Cancel',
+      'panel.purge': 'Delete permanently',
+      'panel.purgeConfirm': 'Delete permanently?',
+      'panel.purging': 'Deleting\u2026',
+      'panel.emptyBin': 'Empty recycle bin',
+      'panel.confirmEmpty': 'Emptying permanently deletes every session in the recycle bin. This cannot be undone.',
+      'panel.confirmEmptyYes': 'Empty it',
+      'panel.emptying': 'Emptying\u2026',
+      'panel.close': 'Close',
+      'panel.busy': 'Working\u2026',
+      'panel.failed': 'Action failed',
+      'panel.partialFailed': 'Some sessions could not be deleted and stay in the recycle bin.',
+      'panel.count': '',
+      'panel.countUnit': 'in the bin',
     }
 
     // --- locale ---------------------------------------------------------------
@@ -126,17 +185,22 @@ window.__ModuleLoader__.load({
       return fallbackT
     }
 
-    // --- pending-request store ------------------------------------------------
+    // --- module store ---------------------------------------------------------
     //
-    // One module-level cell shared by the two triggers and the dialog. The
-    // triggers only publish; the overlay occupant renders from it. This keeps
-    // the dialog in exactly one place without inventing cross-slot plumbing.
+    // One module-level cell shared by the three triggers, the two overlays and
+    // the footer count. The triggers only publish; the overlays render from it.
+    // This keeps each surface in exactly one place without inventing cross-slot
+    // plumbing, and lets the footer badge track edits made inside the panel.
 
-    let pending = null
+    let pending = null // the Session a move-to-bin confirm is about
+    let binOpen = false
+    let binEntries = []
+    let binStatus = 'idle' // idle | loading | ready
+    let binError = null
+
     const listeners = new Set()
 
-    function publish(next) {
-      pending = next
+    function notify() {
       for (const listener of listeners) {
         try {
           listener()
@@ -151,10 +215,17 @@ window.__ModuleLoader__.load({
       return () => listeners.delete(listener)
     }
 
-    function usePending() {
-      const [value, setValue] = React.useState(pending)
-      React.useEffect(() => subscribe(() => setValue(pending)), [])
-      return value
+    // Re-render on any store change. The selector runs on every render, so the
+    // component always reads the current values rather than a stale snapshot.
+    function useStore(select) {
+      const [, force] = React.useState(0)
+      React.useEffect(() => subscribe(() => force((value) => value + 1)), [])
+      return select()
+    }
+
+    function publish(next) {
+      pending = next
+      notify()
     }
 
     // --- shared styles (theme tokens only) ------------------------------------
@@ -215,6 +286,22 @@ window.__ModuleLoader__.load({
       boxShadow: '0 12px 40px rgba(0,0,0,.28)',
     }
 
+    const binCardStyle = {
+      ...cardStyle,
+      width: 'min(560px, calc(100vw - 48px))',
+      display: 'flex',
+      flexDirection: 'column',
+      overflow: 'hidden',
+      padding: 0,
+    }
+
+    const binHeaderStyle = {
+      display: 'flex',
+      alignItems: 'baseline',
+      gap: 8,
+      padding: '18px 20px 0',
+    }
+
     const titleStyle = {
       margin: '0 0 12px',
       fontSize: 15,
@@ -243,17 +330,6 @@ window.__ModuleLoader__.load({
       fontSize: 13,
       lineHeight: '20px',
       color: 'var(--dsw-alias-state-warn-primary)',
-    }
-
-    const ackStyle = {
-      display: 'flex',
-      alignItems: 'flex-start',
-      gap: 8,
-      margin: '4px 0 0',
-      fontSize: 13,
-      lineHeight: '20px',
-      color: 'var(--dsw-alias-label-primary)',
-      cursor: 'pointer',
     }
 
     const footerStyle = {
@@ -285,6 +361,21 @@ window.__ModuleLoader__.load({
       color: '#fff',
     }
 
+    const subtleButtonStyle = {
+      ...baseButtonStyle,
+      border: '1px solid var(--dsw-alias-border-l2)',
+      background: 'transparent',
+      color: 'var(--dsw-alias-label-primary)',
+      padding: '4px 10px',
+      fontSize: 12,
+    }
+
+    const rowDangerButtonStyle = {
+      ...subtleButtonStyle,
+      border: '1px solid var(--dsw-alias-state-error-primary)',
+      color: 'var(--dsw-alias-state-error-primary)',
+    }
+
     const statusStyle = {
       marginTop: 8,
       fontSize: 12,
@@ -300,11 +391,71 @@ window.__ModuleLoader__.load({
       overflowWrap: 'anywhere',
     }
 
+    const countPillStyle = {
+      fontSize: 12,
+      lineHeight: '18px',
+      padding: '0 8px',
+      borderRadius: 999,
+      background: 'var(--dsw-alias-bg-layer-2)',
+      color: 'var(--dsw-alias-label-secondary)',
+      flex: 'none',
+    }
+
+    const listStyle = {
+      overflowY: 'auto',
+      maxHeight: 'min(48vh, 420px)',
+      padding: '4px 20px 8px',
+      margin: 0,
+      listStyle: 'none',
+    }
+
+    const rowStyle = {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10,
+      padding: '10px 0',
+      borderBottom: '1px solid var(--dsw-alias-border-l1)',
+    }
+
+    const rowMainStyle = {
+      flex: 1,
+      minWidth: 0,
+    }
+
+    const rowTitleStyle = {
+      fontSize: 13,
+      lineHeight: '20px',
+      color: 'var(--dsw-alias-label-primary)',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap',
+    }
+
+    const rowMetaStyle = {
+      fontSize: 12,
+      lineHeight: '16px',
+      color: 'var(--dsw-alias-label-secondary)',
+    }
+
+    const warnBarStyle = {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8,
+      margin: '0 20px 4px',
+      padding: '8px 12px',
+      borderRadius: 8,
+      border: '1px solid var(--dsw-alias-state-warn-primary)',
+      background: 'var(--dsw-alias-bg-layer-2)',
+      color: 'var(--dsw-alias-state-warn-primary)',
+      fontSize: 12,
+      lineHeight: '18px',
+    }
+
     function disabled(style, isDisabled) {
       return isDisabled ? { ...style, opacity: 0.5, cursor: 'default' } : style
     }
 
-    // --- glyph ----------------------------------------------------------------
+    // --- glyphs ---------------------------------------------------------------
 
     const TRASH_PATH =
       'M14.478 4.841l-.264 5.274c-.104 2.072-.147 2.896-.827 3.846a4.16 4.16 0 0 1-1.045 1.011c-.518.334-1.1.478-1.783.547-.671.067-1.509.066-2.558.066s-1.887-.001-2.559-.066c-.683-.069-1.265-.213-1.784-.547a4.16 4.16 0 0 1-1.044-1.011c-.68-.95-.724-1.774-.827-3.846L1.522 4.841l1.368-.068.263 5.273c.11 2.176.172 2.556.574 3.117.182.254.41.471.673.64.262.17.603.277 1.179.335.587.058 1.344.059 2.421.059s1.835-.001 2.422-.059c.576-.058.916-.165 1.179-.334.262-.169.491-.387.673-.64.402-.561.464-.941.573-3.117l.264-5.273 1.368.068zM5.43 6.228h1.37v5.163H5.43V6.228zm3.771 0h1.37v5.163h-1.37V6.228zM8.536.434c.644 0 1.116-.007 1.56.137.14.045.276.102.406.168.416.212.744.552 1.2 1.007l.796.795h2.876v1.37H.626v-1.37h2.876l.796-.795C4.754 1.291 5.082.951 5.498.739c.13-.066.266-.123.405-.168C6.348.427 6.82.434 7.464.434h1.072zm-1.072 1.37c-.732 0-.948.007-1.138.069a1.9 1.9 0 0 0-.206.085c-.156.08-.297.204-.679.582h5.117c-.382-.378-.522-.502-.678-.582a1.9 1.9 0 0 0-.206-.085c-.19-.062-.406-.069-1.138-.069H7.464z'
@@ -324,18 +475,38 @@ window.__ModuleLoader__.load({
       )
     }
 
-    // --- host call ------------------------------------------------------------
+    // --- formatting -----------------------------------------------------------
 
-    async function callPurge(sessionId) {
+    function formatDeletedAt(value) {
+      if (!value) return ''
+      const date = new Date(value)
+      if (Number.isNaN(date.getTime())) return ''
+      try {
+        return date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+      } catch {
+        return date.toLocaleString()
+      }
+    }
+
+    function messageOf(reason) {
+      return reason && reason.message ? reason.message : String(reason)
+    }
+
+    // --- host calls -----------------------------------------------------------
+
+    // One request shape for every route: the Host always answers JSON, and a
+    // non-2xx answer always carries `error`, so the message survives to the UI.
+    async function request(method, path, body) {
+      const init = { method, headers: {} }
+      if (body !== undefined) {
+        init.headers['content-type'] = 'application/json'
+        init.body = JSON.stringify(body)
+      }
       let response
       try {
-        response = await fetch(ENDPOINT, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sessionId }),
-        })
+        response = await fetch(BASE + path, init)
       } catch (reason) {
-        throw new Error(reason && reason.message ? reason.message : String(reason))
+        throw new Error(messageOf(reason))
       }
       let payload = {}
       try {
@@ -349,9 +520,36 @@ window.__ModuleLoader__.load({
       return payload
     }
 
-    // --- entry points ---------------------------------------------------------
+    async function loadBin() {
+      binStatus = 'loading'
+      notify()
+      try {
+        const payload = await request('GET', '/trash')
+        binEntries = Array.isArray(payload.entries) ? payload.entries : []
+        binError = null
+      } catch (reason) {
+        binError = messageOf(reason)
+      }
+      binStatus = 'ready'
+      notify()
+    }
 
-    function PurgeMenuItem(props) {
+    function openBin() {
+      binOpen = true
+      notify()
+      // Always re-read: the bin can be changed from another window, or by the
+      // Harness's own archived view.
+      loadBin()
+    }
+
+    function closeBin() {
+      binOpen = false
+      notify()
+    }
+
+    // --- the two triggers -----------------------------------------------------
+
+    function BinMenuItem(props) {
       const t = tOf(props)
       const { sessionId, displayTitle } = props
       // Supplied by the slot owner (ui-workspace) for this menu.
@@ -360,8 +558,10 @@ window.__ModuleLoader__.load({
 
       const onSelect = React.useCallback(() => {
         if (menu && typeof menu[1] === 'function') menu[1](false)
-        publish({ sessionId, title: displayTitle || '', running: undefined, phase: 'confirm' })
+        publish({ sessionId, title: displayTitle || '', running: undefined })
       }, [menu, sessionId, displayTitle])
+
+      if (!sessionId) return null
 
       return React.createElement(
         'button',
@@ -379,7 +579,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function PurgeHeaderButton(props) {
+    function BinHeaderButton(props) {
       const t = tOf(props)
       const { sessionId } = props
 
@@ -395,7 +595,7 @@ window.__ModuleLoader__.load({
       const title = summary ? summary.displayTitle || summary.title || '' : ''
 
       const onClick = React.useCallback(() => {
-        publish({ sessionId, title, running, phase: 'confirm' })
+        publish({ sessionId, title, running })
       }, [sessionId, title, running])
 
       if (!sessionId) return null
@@ -414,23 +614,115 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function PurgeDialog(props) {
+    // --- the footer entry -----------------------------------------------------
+
+    function BinFooterButton(props) {
       const t = tOf(props)
-      const request = usePending()
-      const [acknowledged, setAcknowledged] = React.useState(false)
+      const state = useStore(() => ({ count: binEntries.length, status: binStatus }))
+      const wide = props && props.wide === true
+      const asked = React.useRef(false)
+
+      React.useEffect(() => {
+        if (asked.current) return
+        asked.current = true
+        // The badge is part of the first paint, so the count is requested as
+        // soon as the footer exists rather than on the first open.
+        if (binStatus === 'idle') loadBin()
+      }, [])
+
+      const [hover, setHover] = React.useState(false)
+
+      const icon = React.createElement(
+        'span',
+        { style: { position: 'relative', display: 'inline-flex', flex: 'none' } },
+        React.createElement(TrashIcon, { size: 16 }),
+        state.count > 0
+          ? React.createElement('span', {
+              'aria-hidden': true,
+              style: {
+                position: 'absolute',
+                top: -3,
+                right: -4,
+                width: 6,
+                height: 6,
+                borderRadius: '50%',
+                background: 'var(--dsw-alias-state-error-primary)',
+              },
+            })
+          : null,
+      )
+
+      const label =
+        state.count > 0
+          ? `${t('footer.label')} ${state.count}`
+          : t('footer.label')
+
+      const baseStyle = {
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: wide ? 'flex-start' : 'center',
+        gap: 8,
+        height: 32,
+        padding: wide ? '0 8px' : 0,
+        width: wide ? 'auto' : 32,
+        maxWidth: '100%',
+        border: 'none',
+        borderRadius: 8,
+        background: hover ? 'var(--dsw-alias-bg-layer-2)' : 'transparent',
+        color: 'var(--dsw-alias-label-secondary)',
+        font: 'inherit',
+        fontSize: 13,
+        lineHeight: '20px',
+        cursor: 'pointer',
+        flex: 'none',
+      }
+
+      return React.createElement(
+        'button',
+        {
+          type: 'button',
+          'data-session-purge': 'footer',
+          title: `${t('footer.countTitle')} ${state.count}`,
+          'aria-label': `${t('footer.label')} (${state.count})`,
+          style: baseStyle,
+          onMouseEnter: () => setHover(true),
+          onMouseLeave: () => setHover(false),
+          onClick: openBin,
+        },
+        icon,
+        wide
+          ? React.createElement(
+              'span',
+              {
+                style: {
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                },
+              },
+              label,
+            )
+          : null,
+      )
+    }
+
+    // --- the move-to-bin confirm ----------------------------------------------
+
+    function BinDialog(props) {
+      const t = tOf(props)
+      const current = useStore(() => pending)
       const [busy, setBusy] = React.useState(false)
       const [error, setError] = React.useState(null)
 
-      const open = request !== null && request.phase === 'confirm'
+      const open = current !== null
 
-      // A fresh request always starts unacknowledged.
+      // A fresh request always starts clean.
       React.useEffect(() => {
         if (open) {
-          setAcknowledged(false)
           setError(null)
           setBusy(false)
         }
-      }, [open, request && request.sessionId])
+      }, [open, current && current.sessionId])
 
       const close = React.useCallback(() => {
         setBusy((wasBusy) => {
@@ -449,23 +741,25 @@ window.__ModuleLoader__.load({
       }, [open, close])
 
       const confirm = React.useCallback(async () => {
-        if (!request || !acknowledged || busy) return
+        if (!current || busy) return
         setBusy(true)
         setError(null)
         try {
-          await callPurge(request.sessionId)
+          const requested = current
+          await request('POST', '/trash', { sessionId: requested.sessionId, title: requested.title })
           publish(null)
-          await refreshAfterPurge(request.sessionId)
+          await loadBin()
+          await refreshSessionList({ handoff: requested.sessionId })
         } catch (reason) {
           setBusy(false)
-          setError(reason && reason.message ? reason.message : String(reason))
+          setError(messageOf(reason))
         }
-      }, [request, acknowledged, busy])
+      }, [current, busy])
 
       if (!open) return null
 
-      const name = request.title || t('dialog.untitled')
-      const running = request.running === true
+      const name = current.title || t('dialog.untitled')
+      const running = current.running === true
 
       return React.createElement(
         'div',
@@ -482,6 +776,7 @@ window.__ModuleLoader__.load({
             role: 'dialog',
             'aria-modal': true,
             'aria-label': t('dialog.title'),
+            'data-session-purge': 'dialog',
             style: cardStyle,
             onMouseDown: (event) => event.stopPropagation(),
           },
@@ -495,21 +790,10 @@ window.__ModuleLoader__.load({
             React.createElement('br'),
             t('dialog.idLabel'),
             ': ',
-            request.sessionId,
+            current.sessionId,
           ),
           React.createElement('p', { style: bodyStyle }, t('dialog.desc')),
           running ? React.createElement('p', { style: warnStyle }, t('dialog.running')) : null,
-          React.createElement(
-            'label',
-            { style: ackStyle },
-            React.createElement('input', {
-              type: 'checkbox',
-              checked: acknowledged,
-              disabled: busy,
-              onChange: (event) => setAcknowledged(event.target.checked),
-            }),
-            React.createElement('span', null, t('dialog.ack')),
-          ),
           busy ? React.createElement('div', { style: statusStyle }, t('dialog.busy')) : null,
           error
             ? React.createElement('div', { style: errorStyle, role: 'alert' }, `${t('dialog.failed')}: ${error}`)
@@ -531,8 +815,9 @@ window.__ModuleLoader__.load({
               'button',
               {
                 type: 'button',
-                style: disabled(dangerButtonStyle, busy || !acknowledged),
-                disabled: busy || !acknowledged,
+                'data-session-purge': 'dialog-confirm',
+                style: disabled(dangerButtonStyle, busy),
+                disabled: busy,
                 onClick: confirm,
               },
               busy ? t('dialog.busy') : t('dialog.confirm'),
@@ -542,26 +827,325 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // --- the bin itself -------------------------------------------------------
+
+    function BinPanel(props) {
+      const t = tOf(props)
+      const state = useStore(() => ({ open: binOpen, entries: binEntries, status: binStatus, error: binError }))
+      const [busy, setBusy] = React.useState(null) // sessionId | 'empty' | null
+      const [armed, setArmed] = React.useState(null) // sessionId awaiting a second click
+      const [confirmEmpty, setConfirmEmpty] = React.useState(false)
+      const [error, setError] = React.useState(null)
+      const timer = React.useRef(null)
+
+      const disarm = React.useCallback(() => {
+        if (timer.current) {
+          clearTimeout(timer.current)
+          timer.current = null
+        }
+        setArmed(null)
+      }, [])
+
+      React.useEffect(
+        () => () => {
+          if (timer.current) clearTimeout(timer.current)
+        },
+        [],
+      )
+
+      React.useEffect(() => {
+        if (!state.open) {
+          disarm()
+          setConfirmEmpty(false)
+          setError(null)
+          return undefined
+        }
+        const onKey = (event) => {
+          if (event.key !== 'Escape') return
+          // Escape backs out of a pending confirmation FIRST and only closes the
+          // panel when nothing is pending: an armed permanent delete must never
+          // be a state the user cannot leave.
+          if (armed !== null) {
+            disarm()
+            return
+          }
+          if (confirmEmpty) {
+            setConfirmEmpty(false)
+            return
+          }
+          closeBin()
+        }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+      }, [state.open, armed, confirmEmpty, disarm])
+
+      // Arm a row's permanent delete. A second click within the window commits,
+      // which keeps the irreversible action two gestures away without raising a
+      // second modal on top of the panel.
+      const arm = React.useCallback(
+        (sessionId) => {
+          if (timer.current) clearTimeout(timer.current)
+          setArmed(sessionId)
+          timer.current = setTimeout(() => {
+            timer.current = null
+            setArmed(null)
+          }, CONFIRM_WINDOW_MS)
+        },
+        [],
+      )
+
+      const purge = React.useCallback(
+        async (sessionId) => {
+          if (busy) return
+          setBusy(sessionId)
+          setError(null)
+          disarm()
+          try {
+            await request('POST', '/purge', { sessionId })
+            await loadBin()
+            await refreshSessionList({ handoff: sessionId })
+          } catch (reason) {
+            setError(messageOf(reason))
+          }
+          setBusy(null)
+        },
+        [busy, disarm],
+      )
+
+      const restore = React.useCallback(
+        async (sessionId) => {
+          if (busy) return
+          setBusy(sessionId)
+          setError(null)
+          disarm()
+          try {
+            await request('POST', '/restore', { sessionId })
+            await loadBin()
+            await refreshSessionList({})
+          } catch (reason) {
+            setError(messageOf(reason))
+          }
+          setBusy(null)
+        },
+        [busy, disarm],
+      )
+
+      const emptyAll = React.useCallback(async () => {
+        if (busy) return
+        setBusy('empty')
+        setError(null)
+        try {
+          const payload = await request('POST', '/empty')
+          setConfirmEmpty(false)
+          await loadBin()
+          await refreshSessionList({})
+          if (Array.isArray(payload.failed) && payload.failed.length > 0) {
+            setError(t('panel.partialFailed'))
+          }
+        } catch (reason) {
+          setError(messageOf(reason))
+        }
+        setBusy(null)
+      }, [busy, t])
+
+      if (!state.open) return null
+
+      const entries = state.entries
+      const count = entries.length
+
+      const rows = entries.map((entry) => {
+        const id = entry.sessionId
+        const rowBusy = busy === id || busy === 'empty'
+        const isArmed = armed === id
+        return React.createElement(
+          'li',
+          { key: id, style: rowStyle, 'data-session-purge': 'trash-row' },
+          React.createElement(
+            'div',
+            { style: rowMainStyle },
+            React.createElement(
+              'div',
+              { style: rowTitleStyle, title: entry.title || t('panel.untitled') },
+              entry.title || t('panel.untitled'),
+            ),
+            React.createElement(
+              'div',
+              { style: rowMetaStyle },
+              `${t('panel.deletedAt')} ${formatDeletedAt(entry.deletedAt) || '\u2014'}`,
+            ),
+          ),
+          // While a row is armed, its leading button becomes the way OUT of that
+          // state, so a permanent delete is always one click from being called
+          // off. It takes the restore button's place rather than adding a third
+          // control: the row keeps its width, and the same finger position now
+          // means "back off" instead of "restore" — the safe direction.
+          isArmed
+            ? React.createElement(
+                'button',
+                {
+                  type: 'button',
+                  'data-session-purge': 'trash-cancel',
+                  style: disabled(subtleButtonStyle, rowBusy),
+                  disabled: rowBusy,
+                  onClick: disarm,
+                },
+                t('panel.cancel'),
+              )
+            : React.createElement(
+                'button',
+                {
+                  type: 'button',
+                  'data-session-purge': 'trash-restore',
+                  style: disabled(subtleButtonStyle, rowBusy),
+                  disabled: rowBusy,
+                  onClick: () => restore(id),
+                },
+                busy === id ? t('panel.restoring') : t('panel.restore'),
+              ),
+          React.createElement(
+            'button',
+            {
+              type: 'button',
+              'data-session-purge': 'trash-purge',
+              'data-armed': isArmed ? 'true' : 'false',
+              style: disabled(isArmed ? dangerButtonStyle : rowDangerButtonStyle, rowBusy),
+              disabled: rowBusy,
+              onClick: () => (isArmed ? purge(id) : arm(id)),
+            },
+            busy === id ? t('panel.purging') : isArmed ? t('panel.purgeConfirm') : t('panel.purge'),
+          ),
+        )
+      })
+
+      return React.createElement(
+        'div',
+        {
+          style: backdropStyle,
+          role: 'presentation',
+          onMouseDown: (event) => {
+            if (event.target === event.currentTarget) closeBin()
+          },
+        },
+        React.createElement(
+          'div',
+          {
+            role: 'dialog',
+            'aria-modal': true,
+            'aria-label': t('panel.title'),
+            'data-session-purge': 'trash-panel',
+            style: binCardStyle,
+            onMouseDown: (event) => event.stopPropagation(),
+          },
+          React.createElement(
+            'div',
+            { style: binHeaderStyle },
+            React.createElement('h2', { style: { ...titleStyle, margin: 0, flex: '1 1 auto' } }, t('panel.title')),
+            React.createElement('span', { style: countPillStyle }, `${t('panel.count')} ${count} ${t('panel.countUnit')}`.trim()),
+          ),
+          React.createElement(
+            'p',
+            { style: { ...bodyStyle, margin: '6px 20px 0' } },
+            t('panel.subtitle'),
+          ),
+          count === 0
+            ? React.createElement(
+                'div',
+                { style: { padding: '22px 20px 26px', textAlign: 'center' } },
+                React.createElement(
+                  'div',
+                  { style: { fontSize: 13, color: 'var(--dsw-alias-label-primary)' } },
+                  t('panel.empty'),
+                ),
+                React.createElement(
+                  'div',
+                  { style: { ...rowMetaStyle, marginTop: 6 } },
+                  t('panel.emptyHint'),
+                ),
+              )
+            : React.createElement('ul', { style: listStyle }, rows),
+          state.error
+            ? React.createElement('div', { style: { ...errorStyle, margin: '0 20px' }, role: 'alert' }, state.error)
+            : null,
+          error
+            ? React.createElement('div', { style: { ...errorStyle, margin: '0 20px' }, role: 'alert' }, `${t('panel.failed')}: ${error}`)
+            : null,
+          confirmEmpty
+            ? React.createElement(
+                'div',
+                { style: warnBarStyle },
+                React.createElement('span', { style: { flex: '1 1 auto' } }, t('panel.confirmEmpty')),
+                React.createElement(
+                  'button',
+                  {
+                    type: 'button',
+                    'data-session-purge': 'trash-empty-confirm',
+                    style: disabled(dangerButtonStyle, busy === 'empty'),
+                    disabled: busy === 'empty',
+                    onClick: emptyAll,
+                  },
+                  busy === 'empty' ? t('panel.emptying') : t('panel.confirmEmptyYes'),
+                ),
+                React.createElement(
+                  'button',
+                  {
+                    type: 'button',
+                    style: disabled(subtleButtonStyle, busy === 'empty'),
+                    disabled: busy === 'empty',
+                    onClick: () => setConfirmEmpty(false),
+                  },
+                  t('dialog.cancel'),
+                ),
+              )
+            : null,
+          React.createElement(
+            'div',
+            { style: { ...footerStyle, margin: '12px 20px 18px' } },
+            count > 0
+              ? React.createElement(
+                  'button',
+                  {
+                    type: 'button',
+                    'data-session-purge': 'trash-empty',
+                    style: disabled(rowDangerButtonStyle, busy !== null || confirmEmpty),
+                    disabled: busy !== null || confirmEmpty,
+                    onClick: () => setConfirmEmpty(true),
+                  },
+                  t('panel.emptyBin'),
+                )
+              : null,
+            React.createElement(
+              'button',
+              { type: 'button', 'data-session-purge': 'trash-close', style: cancelButtonStyle, onClick: closeBin },
+              t('panel.close'),
+            ),
+          ),
+        ),
+      )
+    }
+
     // --- apply ----------------------------------------------------------------
 
     // The Client Session service: used for the header button's title/run state
-    // and for the in-place list refresh after a delete.
+    // and for the in-place list refresh after every mutation.
     let sessionsService = null
     let clientCtx = null
 
-    // Refresh the sidebar in place after a successful delete — no page reload.
-    // The Client Session service exposes `refresh()`; older builds exposed
-    // `refreshList()`. If the deleted Session was the one on screen, hand off
-    // to the workspace UI service, which owns Session selection (there is no
-    // `open()` on the sessions service itself).
-    async function refreshAfterPurge(deletedId) {
+    // Refresh the sidebar in place — no page reload. The Client Session service
+    // exposes `refresh()`; older builds exposed `refreshList()`. `handoff` is the
+    // Session that just left the list: when it was the one on screen, the
+    // workspace UI service (which owns Session selection) opens the next one.
+    async function refreshSessionList(options) {
+      const handoff = options && options.handoff
       const service = sessionsService
       try {
-        const before = service && service.list ? service.list.getSnapshot() : null
-        const wasCurrent =
-          before && before.byId && before.byId[deletedId]
-            ? (before.byId[deletedId].retainedBy?.mainView ?? 0) > 0
-            : false
+        let wasCurrent = false
+        if (handoff && service && service.list) {
+          const before = service.list.getSnapshot()
+          wasCurrent =
+            before && before.byId && before.byId[handoff]
+              ? (before.byId[handoff].retainedBy?.mainView ?? 0) > 0
+              : false
+        }
 
         if (service && typeof service.refresh === 'function') {
           await service.refresh()
@@ -575,14 +1159,14 @@ window.__ModuleLoader__.load({
         if (!wasCurrent) return
         const snapshot = service.list.getSnapshot()
         const ids = (snapshot && snapshot.ids) || []
-        const next = ids.find((id) => id !== deletedId)
+        const next = ids.find((id) => id !== handoff)
         const uiWorkspace =
           clientCtx && typeof clientCtx.get === 'function' ? clientCtx.get('uiWorkspace') : null
         if (next && uiWorkspace && typeof uiWorkspace.openSession === 'function') {
           uiWorkspace.openSession(next)
         }
       } catch {
-        /* the delete succeeded; a refresh hiccup is not a delete failure */
+        /* the mutation succeeded; a refresh hiccup is not a failure of it */
       }
     }
 
@@ -612,24 +1196,23 @@ window.__ModuleLoader__.load({
       const localeSeat = () => (localeService ? { locale: NS } : {})
 
       ctx.slots.inject(MENU_SLOT, () =>
-        ctx.slots.register(
-          { name: MENU_SLOT, id: ID_MENU, order: 500, ...localeSeat() },
-          PurgeMenuItem,
-        ),
+        ctx.slots.register({ name: MENU_SLOT, id: ID_MENU, order: 500, ...localeSeat() }, BinMenuItem),
       )
 
       ctx.slots.inject(HEADER_SLOT, () =>
-        ctx.slots.register(
-          { name: HEADER_SLOT, id: ID_HEADER, order: 30, ...localeSeat() },
-          PurgeHeaderButton,
-        ),
+        ctx.slots.register({ name: HEADER_SLOT, id: ID_HEADER, order: 30, ...localeSeat() }, BinHeaderButton),
+      )
+
+      ctx.slots.inject(FOOTER_SLOT, () =>
+        ctx.slots.register({ name: FOOTER_SLOT, id: ID_FOOTER, order: 10, ...localeSeat() }, BinFooterButton),
       )
 
       ctx.slots.inject(OVERLAY_SLOT, () =>
-        ctx.slots.register(
-          { name: OVERLAY_SLOT, id: ID_DIALOG, order: 100, ...localeSeat() },
-          PurgeDialog,
-        ),
+        ctx.slots.register({ name: OVERLAY_SLOT, id: ID_DIALOG, order: 100, ...localeSeat() }, BinDialog),
+      )
+
+      ctx.slots.inject(OVERLAY_SLOT, () =>
+        ctx.slots.register({ name: OVERLAY_SLOT, id: ID_PANEL, order: 110, ...localeSeat() }, BinPanel),
       )
     }
 

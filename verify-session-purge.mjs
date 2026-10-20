@@ -70,6 +70,10 @@ const workspaces = [
 ]
 const archivedSessionIds = [ARCHIVED]
 const pinnedSessionIds = [PINNED]
+// Ids the registry will accept an archive for. The real service requires the
+// Session to exist (live or in persistence), so the stub throws otherwise.
+const archiveCalls = []
+const knownSessionIds = new Set()
 const workspaceRegistry = {
   list: () => workspaces,
   get archivedSessionIds() {
@@ -77,6 +81,15 @@ const workspaceRegistry = {
   },
   get pinnedSessionIds() {
     return pinnedSessionIds
+  },
+  // Modelled on the real contract: archive requires the Session to exist and
+  // drops the pin in the same write; unarchive is an idempotent no-op.
+  async archiveSession(id, options) {
+    archiveCalls.push({ id, options })
+    if (!knownSessionIds.has(id)) throw new Error(`session not found: ${id}`)
+    if (!archivedSessionIds.includes(id)) archivedSessionIds.unshift(id)
+    const pinnedAt = pinnedSessionIds.indexOf(id)
+    if (pinnedAt >= 0) pinnedSessionIds.splice(pinnedAt, 1)
   },
   async unarchiveSession(id) {
     const at = archivedSessionIds.indexOf(id)
@@ -155,7 +168,19 @@ const check = (name, ok, detail) => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  — ${detail}` : ''}`)
 }
 
-check('routes registered', registeredRoutes.length === 2, registeredRoutes.map((r) => r.path).join(', '))
+const EXPECTED_ROUTES = [
+  '/__session-purge/list',
+  '/__session-purge/trash',
+  '/__session-purge/restore',
+  '/__session-purge/empty',
+  '/__session-purge/purge',
+]
+check(
+  'routes registered',
+  registeredRoutes.length === EXPECTED_ROUTES.length &&
+    EXPECTED_ROUTES.every((routePath) => registeredRoutes.some((route) => route.path === routePath)),
+  registeredRoutes.map((route) => route.path).join(', '),
+)
 check('tool registered', captured.name === 'session_purge' && typeof captured.execute === 'function', captured.name)
 
 // 1. a fully-accounted Session is purged end to end
@@ -333,6 +358,139 @@ const unknownBody = JSON.stringify({ sessionId: UNKNOWN })
     `status=${res.state.status} body=${res.state.body}`,
   )
 }
+
+// 9. The recycle bin: "delete" is two steps, and only the second one destroys.
+const BIN_A = 'session-7a1b2c3d-1111-4222-8333-444455556666'
+const BIN_B = 'session-7a1b2c3d-2222-4222-8333-444455556666'
+const BIN_C = 'session-7a1b2c3d-3333-4222-8333-444455556666'
+const BIN_D = 'session-7a1b2c3d-4444-4222-8333-444455556666'
+
+const TRASH_PATH = '/__session-purge/trash'
+const RESTORE_PATH = '/__session-purge/restore'
+const EMPTY_PATH = '/__session-purge/empty'
+const PURGE_PATH = '/__session-purge/purge'
+
+const binIndexPath = path.join(DSH, 'session-purge', 'trash.json')
+
+function binEntryCount() {
+  try {
+    const state = JSON.parse(fs.readFileSync(binIndexPath, 'utf8'))
+    return Array.isArray(state.entries) ? state.entries.length : -1
+  } catch {
+    return -1
+  }
+}
+
+function seedBinSession(id) {
+  const dir = makeLogDir(SLUG_B, id)
+  projectionRows.set(id, { rows: { title: { val: `seeded ${id.slice(-4)}` } } })
+  knownSessionIds.add(id)
+  return dir
+}
+
+async function callRoute(routePath, method, payload) {
+  const route = routesWith({ requestRejection: () => undefined }).find((item) => item.path === routePath)
+  if (!route) throw new Error(`route not registered: ${routePath}`)
+  const res = makeRes()
+  const body = payload === undefined ? undefined : JSON.stringify(payload)
+  await route.handler(makeReq(method, body), res)
+  let parsed = null
+  try {
+    parsed = res.state.body ? JSON.parse(res.state.body) : null
+  } catch {
+    parsed = res.state.body
+  }
+  return { status: res.state.status, body: parsed }
+}
+
+// (a) moving to the bin must ARCHIVE, not destroy: every byte stays behind.
+const binDirA = seedBinSession(BIN_A)
+const trashedA = await callRoute(TRASH_PATH, 'POST', { sessionId: BIN_A, title: '要删的会话' })
+check(
+  'bin: move accepted',
+  trashedA.status === 200 && trashedA.body && trashedA.body.ok === true,
+  `status=${trashedA.status} body=${JSON.stringify(trashedA.body)}`,
+)
+check('bin: session archived', archivedSessionIds.includes(BIN_A), archivedSessionIds.join(',') || '(none)')
+check(
+  'bin: archive asked to stop running work',
+  archiveCalls.some((call) => call.options && call.options.stopActivity === true),
+)
+check('bin: log dir KEPT on disk', fs.existsSync(binDirA), `exists=${fs.existsSync(binDirA)}`)
+check('bin: projection row KEPT', projectionRows.has(BIN_A))
+check('bin: index holds one entry', binEntryCount() === 1, `entries=${binEntryCount()}`)
+
+// (b) the listing carries the title and a parseable deletion date
+const listed = await callRoute(TRASH_PATH, 'GET')
+const listedEntry = listed.body && Array.isArray(listed.body.entries) ? listed.body.entries[0] : null
+check(
+  'bin: list answers with the entry',
+  listed.status === 200 && Boolean(listedEntry) && listedEntry.sessionId === BIN_A,
+  `status=${listed.status}`,
+)
+check('bin: list keeps the title', Boolean(listedEntry) && listedEntry.title === '要删的会话', listedEntry && listedEntry.title)
+check(
+  'bin: list carries a parseable deletion date',
+  Boolean(listedEntry && listedEntry.deletedAt && !Number.isNaN(Date.parse(listedEntry.deletedAt))),
+  listedEntry && listedEntry.deletedAt,
+)
+
+// (c) restore puts it back and forgets the entry — the files never moved
+const restored = await callRoute(RESTORE_PATH, 'POST', { sessionId: BIN_A })
+check('bin: restore accepted', restored.status === 200, `status=${restored.status} body=${JSON.stringify(restored.body)}`)
+check('bin: restore unarchives', !archivedSessionIds.includes(BIN_A), archivedSessionIds.join(',') || '(none)')
+check('bin: restore kept the log dir', fs.existsSync(binDirA))
+check('bin: restore emptied the index', binEntryCount() === 0, `entries=${binEntryCount()}`)
+
+// (d) a permanent delete from the bin is the only thing that destroys
+await callRoute(TRASH_PATH, 'POST', { sessionId: BIN_A, title: '要删的会话' })
+const purgedA = await callRoute(PURGE_PATH, 'POST', { sessionId: BIN_A })
+check('bin: permanent delete accepted', purgedA.status === 200, `status=${purgedA.status}`)
+check('bin: permanent delete removed the log dir', !fs.existsSync(binDirA))
+check('bin: permanent delete removed the projection row', !projectionRows.has(BIN_A))
+check('bin: permanent delete dropped the bin entry', binEntryCount() === 0, `entries=${binEntryCount()}`)
+
+// (e) empty-all purges every entry and leaves nothing behind
+const binDirB = seedBinSession(BIN_B)
+const binDirC = seedBinSession(BIN_C)
+await callRoute(TRASH_PATH, 'POST', { sessionId: BIN_B, title: 'B' })
+await callRoute(TRASH_PATH, 'POST', { sessionId: BIN_C, title: 'C' })
+check('bin: empty-all starts with two entries', binEntryCount() === 2, `entries=${binEntryCount()}`)
+const emptied = await callRoute(EMPTY_PATH, 'POST')
+check(
+  'bin: empty-all answered for both',
+  emptied.status === 200 && emptied.body && Array.isArray(emptied.body.purged) && emptied.body.purged.length === 2,
+  `status=${emptied.status} purged=${emptied.body && emptied.body.purged && emptied.body.purged.length}`,
+)
+check('bin: empty-all removed both log dirs', !fs.existsSync(binDirB) && !fs.existsSync(binDirC))
+check('bin: empty-all emptied the index', binEntryCount() === 0, `entries=${binEntryCount()}`)
+
+// (f) reconcile: a Session restored through the Harness's OWN archived view must
+// not keep a phantom bin entry behind.
+const binDirD = seedBinSession(BIN_D)
+await callRoute(TRASH_PATH, 'POST', { sessionId: BIN_D, title: 'D' })
+check('bin: reconcile starts with one entry', binEntryCount() === 1, `entries=${binEntryCount()}`)
+await workspaceRegistry.unarchiveSession(BIN_D)
+const afterExternal = await callRoute(TRASH_PATH, 'GET')
+check(
+  'bin: reconcile drops an entry restored elsewhere',
+  afterExternal.status === 200 &&
+    Array.isArray(afterExternal.body.entries) &&
+    afterExternal.body.entries.length === 0,
+  `entries=${afterExternal.body && afterExternal.body.entries && afterExternal.body.entries.length}`,
+)
+check('bin: reconcile rewrote the index', binEntryCount() === 0, `entries=${binEntryCount()}`)
+check('bin: reconcile left the files alone', fs.existsSync(binDirD))
+fs.rmSync(binDirD, { recursive: true, force: true })
+projectionRows.delete(BIN_D)
+
+// (g) the bin refuses what it cannot act on
+const trashUnknown = await callRoute(TRASH_PATH, 'POST', { sessionId: UNKNOWN })
+check('bin: unknown id refused with 404', trashUnknown.status === 404, `status=${trashUnknown.status}`)
+const trashInvalid = await callRoute(TRASH_PATH, 'POST', { sessionId: 'nope' })
+check('bin: invalid id refused with 400', trashInvalid.status === 400, `status=${trashInvalid.status}`)
+const restoreMissing = await callRoute(RESTORE_PATH, 'POST', { sessionId: UNKNOWN })
+check('bin: restoring a non-entry refused with 404', restoreMissing.status === 404, `status=${restoreMissing.status}`)
 
 // --- summary -----------------------------------------------------------------
 
